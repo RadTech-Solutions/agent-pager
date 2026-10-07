@@ -1,0 +1,122 @@
+{
+  "name": "agent-pager",
+  "version": "0.1.0",
+  "description": "Pages your phone (ntfy or Telegram) when the coding agent finishes a long turn or needs you, and lets you reply from the phone.",
+  "author": {
+    "name": "RadTech",
+    "url": "https://radtech.nl"
+  },
+  "homepage": "https://github.com/RadTech-Solutions/agent-pager",
+  "repository": "https://github.com/RadTech-Solutions/agent-pager",
+  "license": "MIT",
+  "keywords": [
+    "notifications",
+    "ntfy",
+    "telegram",
+    "pager",
+    "mobile"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "backend": {
+      "type": "string",
+      "title": "Backend",
+      "description": "Where pages go: ntfy (no signup), telegram (your own bot), or off.",
+      "options": [
+        "ntfy",
+        "telegram",
+        "off"
+      ],
+      "default": "ntfy"
+    },
+    "ntfy_topic": {
+      "type": "string",
+      "title": "ntfy topic",
+      "description": "Topic name to publish to. Anyone who knows it can read it, so pick something long and random.",
+      "default": ""
+    },
+    "ntfy_server": {
+      "type": "string",
+      "title": "ntfy server",
+      "description": "ntfy server URL. Leave as is for the public server, or point it at your own.",
+      "default": "https://ntfy.sh"
+    },
+    "ntfy_token": {
+      "type": "string",
+      "title": "ntfy access token",
+      "description": "Optional access token for a protected topic or a self-hosted server.",
+      "sensitive": true
+    },
+    "ntfy_inbound": {
+      "type": "boolean",
+      "title": "Accept prompts over ntfy",
+      "description": "Treat messages you publish to the topic as prompts. Off by default: ntfy has no sender check, so anyone with the topic name could send prompts.",
+      "default": false
+    },
+    "telegram_token": {
+      "type": "string",
+      "title": "Telegram bot token",
+      "description": "The token BotFather gave you for your bot.",
+      "sensitive": true
+    },
+    "telegram_chat_id": {
+      "type": "string",
+      "title": "Telegram chat id",
+      "description": "Your chat id with the bot. Messages from any other chat are ignored.",
+      "default": ""
+    },
+    "inbound": {
+      "type": "boolean",
+      "title": "Reply from the phone",
+      "description": "Poll the backend for your messages and queue them as prompts. One session at a time holds the poller.",
+      "default": true
+    },
+    "poll_seconds": {
+      "type": "number",
+      "title": "Poll interval (seconds)",
+      "description": "How often to check for messages from the phone.",
+      "default": 5,
+      "min": 2,
+      "max": 300
+    },
+    "min_turn_seconds": {
+      "type": "number",
+      "title": "Page after a turn longer than (seconds)",
+      "description": "A finished turn pages you only when it ran at least this long. 0 pages every turn.",
+      "default": 60,
+      "min": 0
+    },
+    "ask_delay_seconds": {
+      "type": "number",
+      "title": "Question delay (seconds)",
+      "description": "Wait this long before paging about an open question, so answering at the keyboard stays quiet.",
+      "default": 10,
+      "min": 0
+    },
+    "min_gap_seconds": {
+      "type": "number",
+      "title": "Minimum gap between pages (seconds)",
+      "description": "Automatic pages closer together than this are dropped.",
+      "default": 30,
+      "min": 0
+    },
+    "quiet_hours": {
+      "type": "string",
+      "title": "Quiet hours",
+      "description": "Local time range with no automatic pages, like 22-07 or 22:30-06:45. Empty means none.",
+      "default": ""
+    },
+    "private_mode": {
+      "type": "boolean",
+      "title": "Private mode",
+      "description": "Send only that the agent needs you, with no project name, reply text or question.",
+      "default": false
+    },
+    "notify_errors": {
+      "type": "boolean",
+      "title": "Page on errors",
+      "description": "Page when a turn ends on an API error.",
+      "default": true
+    }
+  }
+}

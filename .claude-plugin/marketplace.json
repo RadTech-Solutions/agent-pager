@@ -1,0 +1,17 @@
+{
+  "name": "agent-pager",
+  "owner": {
+    "name": "RadTech",
+    "url": "https://radtech.nl"
+  },
+  "metadata": {
+    "description": "agent-pager: phone pages and replies for Claude Code sessions"
+  },
+  "plugins": [
+    {
+      "name": "agent-pager",
+      "source": "./",
+      "description": "Pages your phone when the coding agent needs you, and lets you reply from the phone."
+    }
+  ]
+}
