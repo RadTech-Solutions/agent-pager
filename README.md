@@ -10,7 +10,7 @@ agent-pager is a Claude Code mod (a plugin of function hooks, Claude Code 2.1.28
 - the agent waits on you: an `AskUserQuestion` dialog that stays unanswered for a few seconds, a permission prompt you have not reacted to (the engine's `permission_prompt` notification, which fires after a short idle delay, so it stays quiet while you are typing), or an MCP input form.
 - a turn ends on an API error or a refusal (optional, on by default).
 
-Messages you send back become prompts. They are queued and run when the session is idle. A few words are commands instead:
+Messages you send back become prompts in the one session you picked with `/pager listen`. They are queued and run when that session is idle. A few words are commands instead:
 
 | From the phone | Does |
 | :- | :- |
@@ -33,7 +33,7 @@ All network traffic goes through the engine's `$.http.fetch`. The mod runs no pr
 
 A self-hosted ntfy server works too: set `ntfy_server` to its URL and, for a protected topic, `ntfy_token` to an access token.
 
-Replies over ntfy are off by default. ntfy has no notion of who sent a message, so `ntfy_inbound` only takes effect together with `ntfy_token`: use a protected topic (a self-hosted server, or a reserved topic with access control) where only that token can write. Without a token, `/pager status` says replies are off and why. Telegram is the simpler choice for replies.
+Replies over ntfy are off by default. ntfy has no notion of who sent a message, so `ntfy_inbound` only takes effect together with `ntfy_token`: use a protected topic (a self-hosted server, or a reserved topic with access control) where only that token can write. Without a token, `/pager status` says replies are off and why. With both set, run `/pager listen` in the session that should receive replies. Telegram is the simpler choice for replies.
 
 ### Telegram bot via BotFather
 
@@ -41,6 +41,7 @@ Replies over ntfy are off by default. ntfy has no notion of who sent a message, 
 2. Open a chat with your new bot and send it any message.
 3. Find your chat id: open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and read `message.chat.id` from the answer.
 4. Set `backend` to `telegram`, `telegram_token` to the token and `telegram_chat_id` to the id. Run `/pager test`.
+5. Run `/pager listen` in the session that should receive your replies. About ten seconds later it starts reading them.
 
 The bot must not have a webhook set, since the mod reads messages with `getUpdates`. Only a private chat with you is read: a message counts only when the chat is private and both the chat id and the sender id equal `telegram_chat_id` (in a private chat they are your user id). Groups are not supported, since anyone in a group could prompt your agent. Everything else is ignored without a reply.
 
@@ -95,7 +96,7 @@ Careful: values in `pluginConfigs` are stored as plain text. If you put `telegra
 | `ntfy_inbound` | `false` | Treat messages on the topic as prompts (needs `ntfy_token`) |
 | `telegram_token` | empty | Bot token (sensitive) |
 | `telegram_chat_id` | empty | The only chat that is read and written |
-| `inbound` | `true` | Poll for messages from the phone |
+| `inbound` | `true` | Read messages from the phone, in the session where you run `/pager listen` |
 | `poll_seconds` | `5` | Poll interval |
 | `min_turn_seconds` | `60` | Shortest turn that pages when it finishes; `0` pages every turn |
 | `ask_delay_seconds` | `10` | How long a question waits before it pages |
@@ -113,11 +114,25 @@ In Claude Code:
 | `/pager` or `/pager status` | Where pages go (topic masked), whether paging is paused, thresholds, quiet hours (flagged when invalid), last page, last poll or send error |
 | `/pager test` | Sends a test page now, ignoring pause, quiet hours and the gap |
 | `/pager pause` | Stops automatic pages, in every session, until resumed |
+| `/pager listen` | Makes this session the one that reads messages from the phone |
+| `/pager unlisten` | Stops reading them; no session does until one runs `/pager listen` |
 | `/pager resume` | Turns them back on |
 
 Pause and quiet hours apply to automatic pages. The minimum gap applies to routine pages (finished turns, errors); question and permission pages are never dropped for it. Answers to the phone (the reply to a prompt you sent, `/status`, `/stop`) always go out, since you just asked for them.
 
-Normally one session reads the phone's messages. The first interactive session to poll holds a lease and renews it on every poll, and releases it when the session ends; another session takes over once the holder has been quiet for three poll intervals. A takeover can overlap a single poll, so message ids already handled are remembered and never run twice. On Telegram and on ntfy alike, messages sent before the polling session started are skipped, so a prompt from yesterday does not run in today's session. Headless `claude -p` runs send pages but never poll.
+### One receiver, chosen by you
+
+Pages go out from every session, but only one session reads messages from the phone: the one where you ran `/pager listen`. Until you run it somewhere, replies are not read at all. `/pager status` says which session is the receiver and when it last polled.
+
+Why it works this way: the mod can only keep shared state in `$.store`, which has get, set and delete but no atomic compare-and-set, so two sessions cannot safely race each other for the role. Instead a claim is write, wait, verify. `/pager listen` writes the session's id under one key, waits at least two poll intervals (11 seconds with the default 5 second interval), reads the key again and starts reading only if it still names that session. When two sessions claim at once, the later write wins and the other stands down. The receiver checks that it still holds the role before each poll, after each fetch returns and before each message, so after a handoff the old receiver stops at its next check and drops anything it fetched after losing the role. Each message id is recorded as handled in the store before it is submitted, and the Telegram offset is acknowledged right after, so a message that both sessions saw during a handoff runs once.
+
+What to expect from that:
+
+- A handoff takes about 11 seconds (two poll intervals plus a second). Messages sent in that window are read by the new receiver once it starts.
+- Ending the receiver session gives the role up. A session that crashes keeps it on record until another session runs `/pager listen`; nothing takes over on its own.
+- The handled check and the role check are separate store reads and writes, not one atomic step. The tests drive two overlapping pollers over one shared store and show one submit per message, and a run of two real sessions showed that a store write from one is visible to the other within a fraction of a second. A duplicate would need a session to stall for more than the whole grace period between its role check and its handled check.
+
+On Telegram and on ntfy alike, messages sent before the receiving session started are skipped, so a prompt from yesterday does not run in today's session. Headless `claude -p` runs send pages but never read replies.
 
 A failed poll is shown in `/pager status` and retried with exponential backoff, up to five minutes, or after the wait the server asks for (Telegram's `retry_after`). Error texts never include the bot token.
 
@@ -139,7 +154,7 @@ claude plugin validate .
 claude plugin test .
 ```
 
-`claude plugin test` runs `hooks/register.test.tsx` against the engine with a mocked `$.http.fetch`, clock and store. It covers the outbound page format, the Telegram private chat and sender filter, inbound messages reaching `$.prompt.submit`, the reply going back for the phone's own turn and not for a keyboard turn in between, `/status` and `/stop` from the phone, subagent turns, rate limits and backoff, the poller lease, quiet hours (valid and invalid), pause and resume, the minimum gap and its urgent exemption, private mode, the question delay, permission and error pages, and ntfy inbound with its stale message and token checks.
+`claude plugin test` runs `hooks/register.test.tsx` against the engine with a mocked `$.http.fetch`, clock and store, and `hooks/receiver.test.tsx`, which drives the exported poller of two sessions at once over one shared store and a fake Telegram server: no receiver means no submits, only the listening session submits, simultaneous `/pager listen` settles on one receiver with one submit per update, and a handoff during an in-flight fetch or right after a submit does not duplicate. It covers the outbound page format, the Telegram private chat and sender filter, inbound messages reaching `$.prompt.submit`, the reply going back for the phone's own turn and not for a keyboard turn in between, `/status` and `/stop` from the phone, subagent turns, rate limits and backoff, listen, unlisten and takeover, quiet hours (valid and invalid), pause and resume, the minimum gap and its urgent exemption, private mode, the question delay, permission and error pages, and ntfy inbound with its stale message and token checks.
 
 Type checking keeps the `tsconfig.json` outside the repository; the recipe is in the header of `types/index.d.ts`.
 

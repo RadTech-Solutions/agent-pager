@@ -17,12 +17,13 @@ const interactive = atom({ plugin: 'agent-pager', key: 'interactive' } as const,
 // of the turns they started: only those turns' replies go back to the phone.
 const pending = atom({ plugin: 'agent-pager', key: 'pending' } as const, [])
 const remoteTurns = atom({ plugin: 'agent-pager', key: 'remoteTurns' } as const, [])
+// True while this session is the confirmed receiver of phone messages.
+const listening = atom({ plugin: 'agent-pager', key: 'listening' } as const, false)
 
 const BODY_CHARS = 200
 const TELEGRAM_API = 'https://api.telegram.org'
 const OUT_TAG = 'pager-out'
 const MAX_BACKOFF_MS = 5 * 60 * 1000
-const SEEN_KEEP = 200
 
 const HELP = [
   'agent-pager commands:',
@@ -256,13 +257,85 @@ export async function handleInbound($: EngineInterface, cfg: PagerConfig, raw: s
   await reply('queued', isBusy ? 'Queued. It runs when the current turn ends.' : 'Running now.')
 }
 
-/** True the first time `id` is seen under `key`; remembers the last few. */
-async function firstSight($: EngineInterface, key: string, id: string): Promise<boolean> {
-  const seen = await $.store.get(key)
-  const list = Array.isArray(seen) ? (seen as string[]) : []
-  if (list.includes(id)) return false
-  await $.store.set(key, [...list, id].slice(-SEEN_KEEP))
+// One receiver at a time. $.store has no compare-and-set: two sessions can
+// read the same value and both write. So nothing reads the phone until the
+// person picks a session with /pager listen, and a claim is write, wait,
+// verify: each claimant writes { session, at } under 'receiver', waits at
+// least two poll intervals, and listens only if the key still names it. The
+// last write wins, so simultaneous claims settle on one session. The key is
+// written only by a claim, an unlisten and a session's end; the receiver's
+// heartbeat goes to 'beat', so it never overwrites a newer claim.
+
+type Receiver = { session: string; at: number }
+
+function asReceiver(v: unknown): Receiver | null {
+  if (!v || typeof v !== 'object') return null
+  const r = v as Partial<Receiver>
+  return typeof r.session === 'string' ? { session: r.session, at: num(r.at, 0) } : null
+}
+
+/** How long a claim waits before it checks it still holds. */
+export function claimGraceMs(cfg: PagerConfig): number {
+  return cfg.pollMs * 2 + 1000
+}
+
+/** Writes this session's claim; the first poll after the grace verifies it. */
+export async function claimReceiver($: EngineInterface): Promise<void> {
+  const [session, now] = await Promise.all([$.session.id(), $.clock.now()])
+  await $.store.set('receiver', { session, at: now })
+}
+
+/**
+ * The verify half of a claim: once the grace has passed and the receiver key
+ * still names this session, it starts listening. True when it listens.
+ */
+async function confirmClaim($: EngineInterface, cfg: PagerConfig): Promise<boolean> {
+  if (await read($, listening)) return true
+  const [session, r, now] = await Promise.all([$.session.id(), $.store.get('receiver'), $.clock.now()])
+  const rec = asReceiver(r)
+  if (!rec || rec.session !== session || now - rec.at < claimGraceMs(cfg)) return false
+  await update($, listening, () => true)
+  $.ui.toast('agent-pager: this session now receives phone messages.', { timeoutMs: 6000 })
   return true
+}
+
+async function isReceiver($: EngineInterface): Promise<boolean> {
+  const [session, r] = await Promise.all([$.session.id(), $.store.get('receiver')])
+  return asReceiver(r)?.session === session
+}
+
+/** Stops listening; says so once when another session took over. */
+async function stopListening($: EngineInterface, why: string): Promise<void> {
+  if (!(await read($, listening))) return
+  await update($, listening, () => false)
+  $.ui.toast(`agent-pager: ${why}`, { timeoutMs: 8000 })
+}
+
+/** Gives up the receiver role, if this session holds it. */
+export async function unlisten($: EngineInterface): Promise<boolean> {
+  const owned = await isReceiver($)
+  if (owned) await $.store.delete('receiver')
+  await update($, listening, () => false)
+  return owned
+}
+
+/**
+ * Handles a message id once across sessions: false when it was already
+ * handled, else records it (before the caller submits anything).
+ */
+async function markHandled($: EngineInterface, key: string, now: number): Promise<boolean> {
+  if ((await $.store.get(key)) !== undefined) return false
+  await $.store.set(key, now)
+  return true
+}
+
+/** Drops handled-id records older than a day. */
+async function pruneHandled($: EngineInterface, now: number): Promise<void> {
+  const keys = (await $.store.keys()).filter(k => k.startsWith('handled:'))
+  if (keys.length < 200) return
+  for (const k of keys) {
+    if (now - num(await $.store.get(k), 0) > 86_400_000) await $.store.delete(k)
+  }
 }
 
 /** A failed poll: what went wrong, and a later retry. */
@@ -274,6 +347,14 @@ class PollError extends Error {
   }
 }
 
+/** Lost the receiver role between the fetch and the submit. */
+class LostReceiver extends Error {}
+
+/** Ownership check before each message: throws when another session took over. */
+async function stillReceiver($: EngineInterface): Promise<void> {
+  if (!(await isReceiver($))) throw new LostReceiver('another session is the receiver now')
+}
+
 type TelegramUpdate = {
   update_id: number
   message?: { date?: number; text?: string; chat?: { id?: number | string; type?: string }; from?: { id?: number | string } }
@@ -283,6 +364,8 @@ export async function pollTelegram($: EngineInterface, cfg: PagerConfig): Promis
   const offset = num(await $.store.get('tgOffset'), 0)
   const url = `${TELEGRAM_API}/bot${cfg.telegramToken}/getUpdates?timeout=0&offset=${offset}&allowed_updates=${encodeURIComponent('["message"]')}`
   const r = await $.http.fetch(url)
+  // Whatever arrived after the role moved on is the new receiver's.
+  await stillReceiver($)
   let body: { ok?: boolean; result?: TelegramUpdate[]; description?: string; parameters?: { retry_after?: number } }
   try {
     body = JSON.parse(r.text) as typeof body
@@ -293,23 +376,24 @@ export async function pollTelegram($: EngineInterface, cfg: PagerConfig): Promis
     const retry = body.parameters?.retry_after
     throw new PollError(`telegram answered ${r.status}${body.description ? `: ${body.description}` : ''}`, typeof retry === 'number' ? retry * 1000 : null)
   }
-  const updates = Array.isArray(body.result) ? body.result : []
-  if (updates.length === 0) return
+  const updates = (Array.isArray(body.result) ? body.result : []).slice().sort((a, b) => a.update_id - b.update_id)
   const since = Math.floor((await read($, startedAt)) / 1000)
-  let next = offset
-  for (const u of updates) next = Math.max(next, u.update_id + 1)
-  // Advance first, so a prompt that fails is never replayed.
-  await $.store.set('tgOffset', next)
   for (const u of updates) {
+    await stillReceiver($)
     const m = u.message
-    if (!m || typeof m.text !== 'string') continue
     // Private chat with the owner only: in a group anyone could write.
-    if (m.chat?.type !== 'private') continue
-    if (String(m.chat?.id ?? '') !== cfg.telegramChatId) continue
-    if (String(m.from?.id ?? '') !== cfg.telegramChatId) continue
-    if ((m.date ?? 0) < since) continue
-    if (!(await firstSight($, 'tgSeen', String(u.update_id)))) continue
-    await handleInbound($, cfg, m.text)
+    const ours =
+      !!m &&
+      typeof m.text === 'string' &&
+      m.chat?.type === 'private' &&
+      String(m.chat?.id ?? '') === cfg.telegramChatId &&
+      String(m.from?.id ?? '') === cfg.telegramChatId &&
+      (m.date ?? 0) >= since
+    if (ours && (await markHandled($, `handled:tg:${u.update_id}`, await $.clock.now()))) {
+      await handleInbound($, cfg, m.text as string)
+    }
+    // Ack right after, so Telegram stops handing this update out.
+    await $.store.set('tgOffset', Math.max(num(await $.store.get('tgOffset'), 0), u.update_id + 1))
   }
 }
 
@@ -322,59 +406,46 @@ export async function pollNtfy($: EngineInterface, cfg: PagerConfig): Promise<vo
   const headers: Record<string, string> = {}
   if (cfg.ntfyToken) headers.authorization = `Bearer ${cfg.ntfyToken}`
   const r = await $.http.fetch(`${cfg.ntfyServer}/${encodeURIComponent(cfg.ntfyTopic)}/json?poll=1&since=${encodeURIComponent(since)}`, { headers })
+  await stillReceiver($)
   if (!r.ok) {
     const retry = Number(r.headers['retry-after'])
     throw new PollError(`ntfy answered ${r.status}`, Number.isFinite(retry) && retry > 0 ? retry * 1000 : null)
   }
-  const events: NtfyEvent[] = []
   for (const line of r.text.split('\n')) {
     if (!line.trim()) continue
+    let ev: NtfyEvent
     try {
-      events.push(JSON.parse(line) as NtfyEvent)
+      ev = JSON.parse(line) as NtfyEvent
     } catch {
-      // a partial line: skip it
+      continue
     }
-  }
-  const msgs = events.filter(ev => ev.event === 'message' && ev.id)
-  const last = msgs.at(-1)
-  if (!last?.id) return
-  await $.store.set(`ntfySince:${cfg.ntfyTopic}`, last.id)
-  for (const ev of msgs) {
-    if (ev.tags?.includes(OUT_TAG)) continue
+    if (ev.event !== 'message' || !ev.id) continue
+    await stillReceiver($)
     // A stored cursor from an earlier session can reach back past this one.
-    if ((ev.time ?? 0) < start) continue
-    if (!(await firstSight($, 'ntfySeen', String(ev.id)))) continue
-    await handleInbound($, cfg, ev.message ?? '')
+    const ours = !ev.tags?.includes(OUT_TAG) && (ev.time ?? 0) >= start
+    if (ours && (await markHandled($, `handled:ntfy:${ev.id}`, await $.clock.now()))) {
+      await handleInbound($, cfg, ev.message ?? '')
+    }
+    await $.store.set(`ntfySince:${cfg.ntfyTopic}`, ev.id)
   }
 }
 
 /**
- * Takes or renews the poller lease, so that normally one session reads the
- * phone's messages. A takeover can overlap one poll; the seen lists keep a
- * message from running twice. True when this session holds it.
- */
-async function holdLease($: EngineInterface, cfg: PagerConfig): Promise<boolean> {
-  const [id, now, lease] = await Promise.all([$.session.id(), $.clock.now(), $.store.get('lease')])
-  const l = lease as { id?: string; at?: number } | undefined
-  if (l && l.id && l.id !== id && now - num(l.at, 0) < cfg.pollMs * 3) return false
-  await $.store.set('lease', { id, at: now })
-  return true
-}
-
-async function releaseLease($: EngineInterface, sessionId: string): Promise<void> {
-  const lease = (await $.store.get('lease')) as { id?: string } | undefined
-  if (lease?.id === sessionId) await $.store.delete('lease')
-}
-
-/**
- * One poll, skipped while backing off. A failure is stored for /pager status
- * and doubles the wait, up to five minutes, or waits what the server asked.
+ * One poll by the receiver. Checks the role before fetching, after the fetch
+ * and before each message; a session that lost it stops listening and
+ * submits nothing more. A failure is stored for /pager status and doubles
+ * the wait, up to five minutes, or waits what the server asked.
  */
 export async function pollOnce($: EngineInterface, cfg: PagerConfig): Promise<void> {
   if (inboundOff(cfg)) return
-  const now = await $.clock.now()
+  if (!(await confirmClaim($, cfg))) return
+  if (!(await isReceiver($))) {
+    await stopListening($, 'another session now receives phone messages; this one stopped listening.')
+    return
+  }
+  const [now, session] = await Promise.all([$.clock.now(), $.session.id()])
+  await $.store.set('beat', { session, at: now })
   if (now < num(await $.store.get('pollNextAt'), 0)) return
-  if (!(await holdLease($, cfg))) return
   try {
     if (cfg.backend === 'telegram') await pollTelegram($, cfg)
     else await pollNtfy($, cfg)
@@ -382,7 +453,12 @@ export async function pollOnce($: EngineInterface, cfg: PagerConfig): Promise<vo
       await $.store.set('pollFailures', 0)
       await $.store.set('pollNextAt', 0)
     }
+    await pruneHandled($, now)
   } catch (e) {
+    if (e instanceof LostReceiver) {
+      await stopListening($, 'another session now receives phone messages; this one stopped listening.')
+      return
+    }
     const failures = num(await $.store.get('pollFailures'), 0) + 1
     const asked = e instanceof PollError ? e.retryAfterMs : null
     const wait = Math.min(MAX_BACKOFF_MS, asked ?? cfg.pollMs * 2 ** failures)
@@ -393,7 +469,7 @@ export async function pollOnce($: EngineInterface, cfg: PagerConfig): Promise<vo
   }
 }
 
-/** Starts the poller once per copy of the module, in an interactive session. */
+/** Starts the poll timer once per copy of the module, in an interactive session. */
 async function ensurePoller($: EngineInterface, cfg: PagerConfig): Promise<void> {
   if (pollerRunning || inboundOff(cfg)) return
   if (!(await read($, interactive))) return
@@ -401,6 +477,23 @@ async function ensurePoller($: EngineInterface, cfg: PagerConfig): Promise<void>
   $.clock.every(cfg.pollMs, () => {
     void pollOnce($, cfg).catch(() => undefined)
   })
+}
+
+/** Who receives phone messages, as /pager status says it. */
+async function receiverLine($: EngineInterface, cfg: PagerConfig, now: number): Promise<string> {
+  const off = inboundOff(cfg)
+  if (off) return `Replies from the phone off (${off})`
+  const [session, r, beat, isListening] = await Promise.all([$.session.id(), $.store.get('receiver'), $.store.get('beat'), read($, listening)])
+  const rec = asReceiver(r)
+  if (!rec) return 'Replies from the phone: no session is listening. Run /pager listen in the session that should receive them.'
+  const b = asReceiver(beat)
+  const seen = b && b.session === rec.session ? `, last poll ${duration(now - b.at)} ago` : ''
+  if (rec.session === session) {
+    return isListening
+      ? `Replies from the phone: this session is the receiver, checking every ${cfg.pollMs / 1000}s${seen}`
+      : `Replies from the phone: this session claimed the receiver role; confirming within ${duration(claimGraceMs(cfg))}`
+  }
+  return `Replies from the phone go to another session (${rec.session.slice(0, 8)}${seen}). /pager listen moves them here.`
 }
 
 async function pagerStatus($: EngineInterface, cfg: PagerConfig): Promise<string> {
@@ -415,7 +508,6 @@ async function pagerStatus($: EngineInterface, cfg: PagerConfig): Promise<string
   const why = missing(cfg)
   const target =
     cfg.backend === 'ntfy' ? `ntfy topic "${mask(cfg.ntfyTopic)}" on ${cfg.ntfyServer}` : cfg.backend === 'telegram' ? `Telegram chat ${cfg.telegramChatId}` : 'nowhere'
-  const off = inboundOff(cfg)
   const last = typeof lastAt === 'number' ? `${duration(now - lastAt)} ago` : 'never'
   const quiet = !cfg.quietHours ? 'none' : !parseQuietHours(cfg.quietHours) ? `"${cfg.quietHours}" is invalid, ignored (use 22-07 or 22:30-06:45)` : `${cfg.quietHours}${inQuietHours(cfg.quietHours, now) ? ' (now)' : ''}`
   const lines = [
@@ -423,7 +515,7 @@ async function pagerStatus($: EngineInterface, cfg: PagerConfig): Promise<string
     `Paging ${paused === true ? 'paused' : 'on'}; last page ${last}`,
     `Turns longer than ${cfg.minTurnMs / 1000}s page; questions after ${cfg.askDelayMs / 1000}s; gap ${cfg.minGapMs / 1000}s (questions and permissions skip it)`,
     `Quiet hours ${quiet}; private mode ${cfg.privateMode ? 'on' : 'off'}; errors ${cfg.notifyErrors ? 'on' : 'off'}`,
-    `Replies from the phone ${off ? `off (${off})` : `on, checked every ${cfg.pollMs / 1000}s`}`,
+    await receiverLine($, cfg, now),
   ]
   const err = (v: unknown) => (v && typeof v === 'object' && 'text' in v && 'at' in v ? (v as { at: number; text: string }) : null)
   const pe = err(pollErr)
@@ -455,8 +547,8 @@ export const register: Register = (on, options) => {
     try {
       await $.command.register({
         name: 'pager',
-        description: 'agent-pager: status, test, pause, resume',
-        argumentHint: '[status|test|pause|resume]',
+        description: 'agent-pager: status, test, pause, resume, listen, unlisten',
+        argumentHint: '[status|test|pause|resume|listen|unlisten]',
       })
     } catch {
       // the poller and the pages do not depend on the command
@@ -466,7 +558,11 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
-    await releaseLease($, e.sessionId).catch(() => undefined)
+    try {
+      if (asReceiver(await $.store.get('receiver'))?.session === e.sessionId) await $.store.delete('receiver')
+    } catch {
+      // the next /pager listen replaces a stale claim anyway
+    }
     return next(e)
   })
 
@@ -485,7 +581,20 @@ export const register: Register = (on, options) => {
       const why = await page($, cfg, { kind: 'test', label: 'test page', body: 'If you can read this, agent-pager reaches your phone.', force: true })
       return { text: why ? `agent-pager: test page not sent (${why}).` : 'agent-pager: test page sent.' }
     }
-    if (arg && arg !== 'status') return { text: 'Usage: /pager [status|test|pause|resume]' }
+    if (arg === 'listen') {
+      const off = inboundOff(cfg)
+      if (off) return { text: `agent-pager: cannot listen (${off}).` }
+      if ((await read($, listening)) && (await isReceiver($))) return { text: 'agent-pager: this session already receives phone messages.' }
+      await claimReceiver($)
+      return {
+        text: `agent-pager: claimed the receiver role. This session starts reading phone messages in about ${duration(claimGraceMs(cfg))}, unless another session claims it meanwhile; /pager status shows the outcome.`,
+      }
+    }
+    if (arg === 'unlisten') {
+      const owned = await unlisten($)
+      return { text: owned ? 'agent-pager: stopped listening. No session reads phone messages until one runs /pager listen.' : 'agent-pager: this session was not the receiver.' }
+    }
+    if (arg && arg !== 'status') return { text: 'Usage: /pager [status|test|pause|resume|listen|unlisten]' }
     return { text: await pagerStatus($, cfg) }
   })
 

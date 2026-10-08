@@ -68,6 +68,12 @@ async function finishTurn($: Engine, durationMs: number, answer: string, reason:
   await $.turn.complete({ answer, durationMs, isAborted: reason === 'aborted', turnId, reason, ...(agentId ? { agentId } : {}) })
 }
 
+/** /pager listen, then wait out the claim's grace (2 x 5s + 1s). */
+async function listen($: Engine, clock: { advance: (ms: number) => Promise<void> }) {
+  await run($, 'listen')
+  await clock.advance(11_000)
+}
+
 const run = ($: Engine, args: string) => $.command.run({ command: 'pager', args } as Parameters<typeof $.command.run>[0])
 const tgMsg = (update_id: number, text: string, extra: { date?: number; chat?: object; from?: object } = {}) => ({
   update_id,
@@ -118,6 +124,7 @@ test('telegram: only the owner in a private chat reaches the session, as a queue
     return '{"ok":true,"result":[]}'
   })
   await $.session.start(start)
+  await listen($, clock)
   await clock.advance(5_000)
 
   expect(calls[0]!.url).toContain('https://api.telegram.org/bot123:abc/getUpdates?timeout=0&offset=0')
@@ -143,6 +150,7 @@ test('the phone gets the reply of the turn it started, not a keyboard turn in be
     return r
   })
   await $.session.start(start)
+  await listen($, clock)
 
   // A keyboard turn is running when the phone's prompt arrives.
   await $.turn.start({ text: 'refactor the parser', turnId: 'kb' })
@@ -179,6 +187,7 @@ test('telegram /status and /stop from the phone', { options: TG }, async ($, on)
     return r
   })
   await $.session.start(start)
+  await listen($, clock)
   await clock.advance(5_000)
   expect(prompts).toHaveLength(0)
   const status = String(sent().at(-1)!.body?.text)
@@ -203,6 +212,7 @@ test('a subagent turn ending does not mark the session idle', { options: TG }, a
     return r
   })
   await $.session.start(start)
+  await listen($, clock)
   await $.turn.start({ text: 'big job', turnId: 'main' })
   await finishTurn($, 400_000, 'subagent report', 'answer', 'sub1', 'agent-1')
   next = [tgMsg(1, '/status', { date: SEC + 5 })]
@@ -219,6 +229,7 @@ test('telegram rate limit: honours retry_after, shows the error with the token r
     return '{"ok":true,"result":[]}'
   })
   await $.session.start(start)
+  await listen($, clock)
   await clock.advance(5_000)
   const polls = () => calls.filter(c => c.url.includes('getUpdates')).length
   expect(polls()).toBe(1)
@@ -236,6 +247,7 @@ test('telegram rate limit: honours retry_after, shows the error with the token r
 test('failing polls back off exponentially, capped at five minutes', { options: { ...TG, poll_seconds: 5 } }, async ($, on) => {
   const { clock, calls } = engine(on, NOON, url => (url.includes('/getUpdates') ? { status: 502, text: 'bad gateway' } : '{"ok":true}'))
   await $.session.start(start)
+  await listen($, clock)
   const polls = () => calls.filter(c => c.url.includes('getUpdates')).length
   await clock.advance(5_000)
   expect(polls()).toBe(1)
@@ -255,27 +267,45 @@ test('failing polls back off exponentially, capped at five minutes', { options: 
 test('the poller still starts when registering /pager fails', { options: TG }, async ($, on) => {
   const { clock, calls } = engine(on, NOON, undefined, { failRegister: true })
   await $.session.start(start)
+  await listen($, clock)
   await clock.advance(5_000)
   expect(calls.filter(c => c.url.includes('getUpdates'))).toHaveLength(1)
 })
 
-test('session end releases the poller lease, so another session takes over at once', { options: TG }, async ($, on) => {
+test('/pager listen confirms after the grace; session end gives the role up', { options: TG }, async ($, on) => {
+  const { clock, calls } = engine(on, NOON)
+  const polls = () => calls.filter(c => c.url.includes('getUpdates')).length
+  await $.session.start(start)
+  await clock.advance(20_000)
+  expect(polls()).toBe(0)
+  expect((await run($, 'status')).text).toContain('no session is listening')
+
+  expect((await run($, 'listen')).text).toContain('claimed the receiver role')
+  expect((await run($, 'status')).text).toContain('confirming within')
+  await clock.advance(10_000)
+  expect(polls()).toBe(0)
+  await clock.advance(5_000)
+  expect(polls()).toBe(1)
+  expect((await run($, 'status')).text).toContain('this session is the receiver')
+
+  await $.session.end({ reason: 'other', sessionId: 'session-a' } as Parameters<typeof $.session.end>[0])
+  expect((await run($, 'status')).text).toContain('no session is listening')
+})
+
+test('another session claiming the role stops this one', { options: TG }, async ($, on) => {
   const { clock, calls, switchSession } = engine(on, NOON)
   const polls = () => calls.filter(c => c.url.includes('getUpdates')).length
   await $.session.start(start)
-  await clock.advance(5_000)
-  expect(polls()).toBe(1)
-
-  // Without a release, another session waits out the lease (three intervals).
-  switchSession('session-b')
-  await clock.advance(5_000)
-  expect(polls()).toBe(1)
-
-  switchSession('session-a')
-  await $.session.end({ reason: 'other', sessionId: 'session-a' } as Parameters<typeof $.session.end>[0])
-  switchSession('session-b')
-  await clock.advance(5_000)
+  await listen($, clock)
+  await clock.advance(10_000)
   expect(polls()).toBe(2)
+  // Session B runs /pager listen (same store, its own id).
+  switchSession('session-b')
+  await run($, 'listen')
+  switchSession('session-a')
+  await clock.advance(20_000)
+  expect(polls()).toBe(2)
+  expect((await run($, 'status')).text).toContain('go to another session (session-')
 })
 
 test('quiet hours hold automatic pages, but /pager test still goes out', { options: { ...NTFY, quiet_hours: '22-07' } }, async ($, on) => {
@@ -408,6 +438,7 @@ test('ntfy inbound skips its own pages and anything older than the session', { o
     { store: { 'ntfySince:pager-test-topic': 'old0' } },
   )
   await $.session.start(start)
+  await listen($, clock)
   await clock.advance(5_000)
   expect(calls[0]!.url).toBe('https://ntfy.sh/pager-test-topic/json?poll=1&since=old0')
   expect(calls[0]!.headers.authorization).toBe('Bearer tk_secret')
@@ -422,6 +453,7 @@ test('ntfy inbound refuses to run without an access token', { options: { ...NTFY
   await clock.advance(20_000)
   expect(calls).toHaveLength(0)
   expect((await run($, 'status')).text).toContain('Replies from the phone off (ntfy_inbound needs ntfy_token')
+  expect((await run($, 'listen')).text).toContain('cannot listen (ntfy_inbound needs ntfy_token')
 })
 
 test('with ntfy inbound off, nothing is polled', { options: NTFY }, async ($, on) => {

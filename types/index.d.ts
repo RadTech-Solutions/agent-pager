@@ -52,6 +52,6 @@ export type Page = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'agent-pager': { busy: boolean; startedAt: number; interactive: boolean; pending: string[]; remoteTurns: string[] }
+    'agent-pager': { busy: boolean; startedAt: number; interactive: boolean; pending: string[]; remoteTurns: string[]; listening: boolean }
   }
 }

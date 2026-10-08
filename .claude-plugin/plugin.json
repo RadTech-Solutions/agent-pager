@@ -68,7 +68,7 @@
     "inbound": {
       "type": "boolean",
       "title": "Reply from the phone",
-      "description": "Poll the backend for your messages and queue them as prompts. One session at a time holds the poller.",
+      "description": "Read messages from the phone and queue them as prompts, in the one session where you run /pager listen.",
       "default": true
     },
     "poll_seconds": {
