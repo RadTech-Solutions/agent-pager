@@ -430,13 +430,33 @@ export async function pollNtfy($: EngineInterface, cfg: PagerConfig): Promise<vo
   }
 }
 
+/** Sessions with a poll in flight: a tick that lands during one is skipped. */
+const polling = new Set<string>()
+
 /**
- * One poll by the receiver. Checks the role before fetching, after the fetch
- * and before each message; a session that lost it stops listening and
- * submits nothing more. A failure is stored for /pager status and doubles
- * the wait, up to five minutes, or waits what the server asked.
+ * One poll by the receiver, never two at once in the same session: a second
+ * call while one runs returns straight away, and the guard is released even
+ * when the poll throws. The check and the add sit together after the only
+ * await, so two calls cannot both get past it.
  */
 export async function pollOnce($: EngineInterface, cfg: PagerConfig): Promise<void> {
+  const session = await $.session.id()
+  if (polling.has(session)) return
+  polling.add(session)
+  try {
+    await pollGuarded($, cfg)
+  } finally {
+    polling.delete(session)
+  }
+}
+
+/**
+ * Checks the role before fetching, after the fetch and before each message;
+ * a session that lost it stops listening and submits nothing more. A failure
+ * is stored for /pager status and doubles the wait, up to five minutes, or
+ * waits what the server asked.
+ */
+async function pollGuarded($: EngineInterface, cfg: PagerConfig): Promise<void> {
   if (inboundOff(cfg)) return
   if (!(await confirmClaim($, cfg))) return
   if (!(await isReceiver($))) {

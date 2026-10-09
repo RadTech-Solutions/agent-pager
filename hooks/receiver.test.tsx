@@ -207,3 +207,31 @@ test('/pager unlisten stops the receiver', async () => {
   expect(w.submits).toEqual([])
   expect(w.store.has('receiver')).toBe(false)
 })
+
+test('two polls at once in the same receiver submit a message once', async () => {
+  const w = world()
+  const a = session('A', w)
+  await claimReceiver(a)
+  w.now += GRACE
+  await pollOnce(a, cfg) // A is listening, nothing to read yet
+  w.updates = [msg(50, 'ship it')]
+  await Promise.all([pollOnce(a, cfg), pollOnce(a, cfg)])
+  expect(w.submits).toEqual([{ session: 'A', text: 'ship it' }])
+})
+
+test('a poll that throws releases the guard for the next one', async () => {
+  const w = world()
+  const a = session('A', w)
+  await claimReceiver(a)
+  w.now += GRACE
+  await pollOnce(a, cfg)
+  w.updates = [msg(60, 'after the error')]
+  w.hold = async () => {
+    throw new Error('network down')
+  }
+  await pollOnce(a, cfg).catch(() => undefined)
+  w.hold = null
+  w.store.delete('pollNextAt')
+  await pollOnce(a, cfg)
+  expect(w.submits).toEqual([{ session: 'A', text: 'after the error' }])
+})
